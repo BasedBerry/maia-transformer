@@ -5,6 +5,8 @@ import os
 import random
 import numpy as np
 import torch
+import torch.nn as nn
+from io import StringIO
 import time
 import requests
 import tqdm
@@ -13,6 +15,7 @@ import re
 
 
 def seed_everything(seed: int):
+
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
@@ -24,6 +27,7 @@ def seed_everything(seed: int):
 
 
 def delete_file(filename):
+    
     if os.path.exists(filename):
         os.remove(filename)
         print(f"Data {filename} has been deleted.")
@@ -32,6 +36,7 @@ def delete_file(filename):
 
 
 def readable_num(num):
+    
     if num >= 1e9:  # if parameters are in the billions
         return f'{num / 1e9:.2f}B'
     elif num >= 1e6:  # if parameters are in the millions
@@ -43,6 +48,7 @@ def readable_num(num):
 
 
 def readable_time(elapsed_time):
+
     hours, rem = divmod(elapsed_time, 3600)
     minutes, seconds = divmod(rem, 60)
 
@@ -55,16 +61,18 @@ def readable_time(elapsed_time):
 
 
 def count_parameters(model):
+    
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
+    
     return readable_num(total_params)
 
 
 def create_elo_dict():
+    
     inteval = 100
     start = 1100
     end = 2000
-
+    
     range_dict = {f"<{start}": 0}
     range_index = 1
 
@@ -74,17 +82,18 @@ def create_elo_dict():
         range_index += 1
 
     range_dict[f">={end}"] = range_index
-
+    
     # print(range_dict, flush=True)
-
+    
     return range_dict
 
 
 def map_to_category(elo, elo_dict):
+
     inteval = 100
     start = 1100
     end = 2000
-
+    
     if elo < start:
         return elo_dict[f"<{start}"]
     elif elo >= end:
@@ -98,7 +107,7 @@ def map_to_category(elo, elo_dict):
 
 def get_side_info(board, move_uci, all_moves_dict):
     move = chess.Move.from_uci(move_uci)
-
+    
     moving_piece = board.piece_at(move.from_square)
     captured_piece = board.piece_at(move.to_square)
 
@@ -107,12 +116,12 @@ def get_side_info(board, move_uci, all_moves_dict):
 
     to_square_encoded = torch.zeros(64)
     to_square_encoded[move.to_square] = 1
-
+    
     if move_uci == 'e1g1':
         rook_move = chess.Move.from_uci('h1f1')
         from_square_encoded[rook_move.from_square] = 1
         to_square_encoded[rook_move.to_square] = 1
-
+    
     if move_uci == 'e1c1':
         rook_move = chess.Move.from_uci('a1d1')
         from_square_encoded[rook_move.from_square] = 1
@@ -121,7 +130,7 @@ def get_side_info(board, move_uci, all_moves_dict):
     board.push(move)
     is_check = board.is_check()
     board.pop()
-
+    
     # Order: Pawn, Knight, Bishop, Rook, Queen, King
     side_info = torch.zeros(6 + 6 + 1)
     side_info[moving_piece.piece_type - 1] = 1
@@ -131,25 +140,27 @@ def get_side_info(board, move_uci, all_moves_dict):
         side_info[6 + captured_piece.piece_type - 1] = 1
     if is_check:
         side_info[-1] = 1
-
+    
     legal_moves = torch.zeros(len(all_moves_dict))
     legal_moves_idx = torch.tensor([all_moves_dict[move.uci()] for move in board.legal_moves])
     legal_moves[legal_moves_idx] = 1
-
+    
     side_info = torch.cat([side_info, from_square_encoded, to_square_encoded, legal_moves], dim=0)
-
+    
     return legal_moves, side_info
 
 
 def extract_clock_time(comment):
+    
     match = re.search(r'\[%clk (\d+):(\d+):(\d+)\]', comment)
     if match:
         hours, minutes, seconds = map(int, match.groups())
         return hours * 3600 + minutes * 60 + seconds
     return None
-
+    
 
 def read_or_create_chunks(pgn_path, cfg):
+
     cache_file = pgn_path.replace('.pgn', '_chunks.pkl')
 
     if os.path.exists(cache_file):
@@ -161,14 +172,15 @@ def read_or_create_chunks(pgn_path, cfg):
         start_time = time.time()
         pgn_chunks = get_chunks(pgn_path, cfg.chunk_size)
         print(f'Chunking took {readable_time(time.time() - start_time)}', flush=True)
-
+        
         with open(cache_file, 'wb') as f:
             pickle.dump(pgn_chunks, f)
-
+    
     return pgn_chunks
 
 
 def board_to_tensor(board):
+    
     piece_types = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
     num_piece_channels = 12  # 6 piece types * 2 colors
     additional_channels = 6  # 1 for player's turn, 4 for castling rights, 1 for en passant
@@ -272,6 +284,149 @@ def tokenize_board_to_tensor(board: chess.Board, token_dim=14):
     tensor = torch.tensor(tokens, dtype=torch.float32)
     return tensor
 
+class MoveTokenizer(nn.Module):
+    def __init__(self, input_dim=136, output_dim=14):
+        """
+        A module to tokenize chess moves into a fixed-dimensional embedding space.
+
+        Args:
+            input_dim (int): Dimensionality of the raw move representation (e.g., 136).
+            output_dim (int): Desired token dimension (e.g., 14, to match square tokens).
+        """
+        super(MoveTokenizer, self).__init__()
+        self.linear = nn.Linear(input_dim, output_dim)
+
+    def forward(self, moves):
+        """
+        Tokenize and project moves to a fixed embedding space.
+
+        Args:
+            moves (torch.Tensor): Tensor of raw move features (num_moves, input_dim).
+
+        Returns:
+            torch.Tensor: Tokenized moves of shape (num_moves, output_dim).
+        """
+        return self.linear(moves)
+
+def raw_move_representation(pgn_moves):
+    """
+    Generate raw move representations (before projection).
+
+    Args:
+        pgn_moves (list of chess.Move): List of moves in PGN format.
+
+    Returns:
+        torch.Tensor: Raw move features of shape (num_moves, 136).
+    """
+    def move_features(move):
+        # Initialize a raw feature vector (136 dimensions)
+        features = [0] * 136
+
+        # Source square (0-63)
+        features[move.from_square] = 1
+
+        # Destination square (64-127)
+        features[64 + move.to_square] = 1
+
+        # Promotion (128-131)
+        promotion_map = {
+            chess.QUEEN: 128,
+            chess.ROOK: 129,
+            chess.BISHOP: 130,
+            chess.KNIGHT: 131,
+        }
+        if move.promotion:
+            features[promotion_map[move.promotion]] = 1
+
+        # Castling flags (132-135)
+        if move.uci() in ["e1g1", "e1c1"]:  # White castling
+            features[132] = 1  # Kingside
+            features[133] = 1  # Queenside
+        elif move.uci() in ["e8g8", "e8c8"]:  # Black castling
+            features[134] = 1  # Kingside
+            features[135] = 1  # Queenside
+
+        return features
+
+    # Generate raw features for each move
+    raw_features = [move_features(move) for move in pgn_moves]
+
+    # Convert to PyTorch tensor
+    return torch.tensor(raw_features, dtype=torch.float32)
+
+# Example Usage
+
+def game_to_tensor(pgn, move_tokenizer, token_dim=14):
+    """
+    Parse a PGN, randomly pick a move, generate the FEN, insert FEN tokens into the move token sequence,
+    and construct a causal mask.
+
+    Args:
+        pgn (str): The PGN string of the game.
+        move_tokenizer (MoveTokenizer): The tokenizer for move embeddings.
+        token_dim (int): The dimension of the tokens (should match square token dimension).
+
+    Returns:
+        torch.Tensor: The combined sequence of move tokens and FEN tokens.
+        torch.Tensor: The corresponding causal mask.
+    """
+    # Parse the PGN
+    pgn_file = StringIO(pgn)  # Wrap the PGN string in a file-like object
+    game = chess.pgn.read_game(pgn_file)
+    board = game.board()
+    moves = list(game.mainline_moves())
+
+    # Generate move tokens
+    raw_move_features = raw_move_representation(moves)  # Shape: (num_moves, 136)
+    move_tokens = move_tokenizer(raw_move_features)  # Shape: (num_moves, token_dim)
+
+    # Randomly pick a move index
+    random_move_index = random.randint(0, len(moves) - 1)
+    selected_move = moves[random_move_index]
+
+    # Replay the game up to the selected move
+    board.reset()
+    for move in moves[:random_move_index + 1]:
+        board.push(move)
+
+    # Generate FEN tokens for the current board state
+    fen_tokens = tokenize_board_to_tensor(board, token_dim=token_dim)  # Shape: (66, token_dim)
+
+    # Combine the sequence: moves up to the FEN, FEN tokens, and remaining moves
+    move_tokens_before_fen = move_tokens[:random_move_index + 1]  # Moves up to the FEN
+    move_tokens_after_fen = move_tokens[random_move_index + 1:]  # Moves after the FEN
+    combined_sequence = torch.cat([move_tokens_before_fen, fen_tokens, move_tokens_after_fen], dim=0)
+
+    # Construct the causal mask
+    num_moves_before = random_move_index + 1
+    num_moves_after = len(moves) - random_move_index - 1
+    num_fen_tokens = fen_tokens.size(0)
+    total_tokens = num_moves_before + num_fen_tokens + num_moves_after
+
+    mask = torch.zeros((total_tokens, total_tokens), dtype=torch.bool)
+
+    # Moves-to-Moves Causal Mask
+    for i in range(num_moves_before):
+        mask[i, i + 1:] = True  # Prevent move i from attending to future moves
+
+    # Moves-to-FEN Mask
+    for i in range(num_moves_before):
+        mask[i, num_moves_before: num_moves_before + num_fen_tokens] = False  # Moves can attend to FEN
+
+    # Moves-after-FEN Causal Mask
+    for i in range(num_moves_before + num_fen_tokens, total_tokens):
+        mask[i, i + 1:] = True  # Moves after FEN cannot attend to future moves
+        mask[i, :num_moves_before] = False  # Moves after FEN can attend to earlier moves
+        mask[i, num_moves_before: num_moves_before + num_fen_tokens] = False  # Moves after FEN can attend to FEN
+
+    # FEN-to-FEN: No restrictions
+    for i in range(num_moves_before, num_moves_before + num_fen_tokens):
+        mask[i, num_moves_before:num_moves_before + num_fen_tokens] = False  # FEN tokens can attend to each other
+        mask[i, :num_moves_before] = False  # FEN tokens can attend to all earlier move tokens
+
+    return combined_sequence, mask
+
+
 
 def generate_pawn_promotions():
     # Define the promotion rows for both colors and the promotion pieces
@@ -306,9 +461,10 @@ def generate_pawn_promotions():
 
 
 def mirror_square(square):
+    
     file = square[0]
     rank = str(9 - int(square[1]))
-
+    
     return file + rank
 
 
@@ -330,6 +486,7 @@ def mirror_move(move_uci):
 
 
 def get_chunks(pgn_path, chunk_size):
+
     chunks = []
     with open(pgn_path, 'r', encoding='utf-8') as pgn_file:
         while True:
@@ -363,26 +520,27 @@ def decompress_zst(file_path, decompressed_path):
 
 
 def get_all_possible_moves():
+    
     all_moves = []
 
     for rank in range(8):
-        for file in range(8):
+        for file in range(8): 
             square = chess.square(file, rank)
-
+            
             board = chess.Board(None)
             board.set_piece_at(square, chess.Piece(chess.QUEEN, chess.WHITE))
             legal_moves = list(board.legal_moves)
             all_moves.extend(legal_moves)
-
+            
             board = chess.Board(None)
             board.set_piece_at(square, chess.Piece(chess.KNIGHT, chess.WHITE))
             legal_moves = list(board.legal_moves)
             all_moves.extend(legal_moves)
-
+    
     all_moves = [all_moves[i].uci() for i in range(len(all_moves))]
-
+    
     pawn_promotions = generate_pawn_promotions()
-
+    
     return all_moves + pawn_promotions
 
 
@@ -390,3 +548,4 @@ def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
+
