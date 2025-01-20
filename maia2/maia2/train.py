@@ -5,7 +5,8 @@ import time
 from .utils import seed_everything, readable_time, readable_num, count_parameters
 from .utils import get_all_possible_moves, create_elo_dict
 from .utils import decompress_zst, read_or_create_chunks
-from .main import MAIA2Model, preprocess_thread, train_chunks, read_monthly_data_path
+# from .main import MAIA2Model, preprocess_thread, train_chunks, read_monthly_data_path
+from .transformer_only import MAIA2Transformer, preprocess_thread, train_chunks, read_monthly_data_path
 import torch
 import torch.nn as nn
 import pdb
@@ -19,15 +20,16 @@ def run(cfg):
     seed_everything(cfg.seed)
     num_processes = cpu_count() - cfg.num_cpu_left
 
-    save_root = f'../saves/{cfg.lr}_{cfg.batch_size}_{cfg.wd}/'
+    save_root = f'../transformer_saves/{cfg.lr}_{cfg.batch_size}_{cfg.wd}_{cfg.num_blocks_vit}/'
     if not os.path.exists(save_root):
         os.makedirs(save_root)
 
     all_moves = get_all_possible_moves()
+    print(all_moves)
     all_moves_dict = {move: i for i, move in enumerate(all_moves)}
     elo_dict = create_elo_dict()
 
-    model = MAIA2Model(len(all_moves), elo_dict, cfg)
+    model = MAIA2Transformer(len(all_moves), elo_dict, cfg)
 
     print(model, flush=True)
     model = model.cuda()
