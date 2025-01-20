@@ -13,7 +13,7 @@ import os
 import pandas as pd
 import time
 from einops import rearrange
-
+from . import train
 
 def process_chunks(cfg, pgn_path, pgn_chunks, elo_dict):
     # process_per_chunk((pgn_chunks[0][0], pgn_chunks[0][1], pgn_path, elo_dict, cfg))
@@ -204,6 +204,7 @@ class MAIA2Dataset(torch.utils.data.Dataset):
 
     def __init__(self, data, all_moves_dict, cfg):
         self.all_moves_dict = all_moves_dict
+        print(all_moves_dict)
         self.data = data
         self.cfg = cfg
 
@@ -355,10 +356,10 @@ class Transformer(nn.Module):
         return self.norm(x)
 
 
-class MAIA2Model(torch.nn.Module):
+class MAIA2Transformer(torch.nn.Module):
     def __init__(self, output_dim, elo_dict, cfg):
-        super(MAIA2Model, self).__init__()
-
+        super(MAIA2Transformer, self).__init__()
+        
         self.cfg = cfg
 
         # Linear layer to project token dimension to transformer input space
@@ -368,12 +369,12 @@ class MAIA2Model(torch.nn.Module):
         heads = 16
         dim_head = 64
         self.transformer = Transformer(
-            cfg.dim_vit,
-            cfg.num_blocks_vit,
-            heads,
-            dim_head,
-            mlp_dim=cfg.dim_vit,
-            dropout=0.1,
+            cfg.dim_vit, 
+            cfg.num_blocks_vit, 
+            heads, 
+            dim_head, 
+            mlp_dim=cfg.dim_vit, 
+            dropout=0.1, 
             elo_dim=cfg.elo_dim * 2
         )
         self.pos_embedding = nn.Parameter(torch.randn(1, cfg.vit_length, cfg.dim_vit))  # cfg.vit_length = 64
@@ -383,38 +384,36 @@ class MAIA2Model(torch.nn.Module):
         self.fc_2 = nn.Linear(cfg.dim_vit, output_dim + 6 + 6 + 1 + 64 + 64)
         self.fc_3 = nn.Linear(128, 1)
         self.fc_3_1 = nn.Linear(cfg.dim_vit, 128)
-
+        
         # Elo embedding
         self.elo_embedding = torch.nn.Embedding(len(elo_dict), cfg.elo_dim)
-
+        
         self.dropout = nn.Dropout(p=0.1)
         self.last_ln = nn.LayerNorm(cfg.dim_vit)
 
     def forward(self, square_tokens, elos_self, elos_oppo):
         batch_size, seq_len, token_dim = square_tokens.size()  # Expecting (batch_size, 64, 19)
-
+        
         # Project token dimension to the transformer's input dimension
         x = self.token_projection(square_tokens)  # Shape: [batch_size, seq_len, dim_vit]
-
+        
         # Add positional embedding
         x += self.pos_embedding
         x = self.dropout(x)
-
+        
         # Embed player ratings
         elos_emb_self = self.elo_embedding(elos_self)
         elos_emb_oppo = self.elo_embedding(elos_oppo)
         elos_emb = torch.cat((elos_emb_self, elos_emb_oppo), dim=1)
-
         # Pass through transformer
         x = self.transformer(x, elos_emb).mean(dim=1)
-
         # Final processing with layer normalization and fully connected layers
         x = self.last_ln(x)
-
+        
         logits_maia = self.fc_1(x)
         logits_side_info = self.fc_2(x)
         logits_value = self.fc_3(self.dropout(torch.relu(self.fc_3_1(x)))).squeeze(dim=-1)
-
+        
         return logits_maia, logits_side_info, logits_value
 
 
@@ -555,7 +554,7 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser()
 
     # Supporting Arguments
-    parser.add_argument('--data_root', default='/datadrive2/lichess_data', type=str)
+    parser.add_argument('--data_root', default='../../../../../grace/u/geilender', type=str)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--num_workers', default=16, type=int)
     parser.add_argument('--verbose', default=1, type=int)
@@ -563,29 +562,30 @@ def parse_args(args=None):
     parser.add_argument('--max_ply', default=300, type=int)
     parser.add_argument('--clock_threshold', default=30, type=int)
     parser.add_argument('--chunk_size', default=20000, type=str)
-    parser.add_argument('--start_year', default=2018, type=int)
+    parser.add_argument('--start_year', default=2019, type=int)
     parser.add_argument('--start_month', default=5, type=int)
-    parser.add_argument('--end_year', default=2023, type=int)
-    parser.add_argument('--end_month', default=11, type=int)
+    parser.add_argument('--end_year', default=2019, type=int)
+    parser.add_argument('--end_month', default=5, type=int)
     parser.add_argument('--from_checkpoint', default=False, type=bool)
     parser.add_argument('--checkpoint_epoch', default=0, type=int)
     parser.add_argument('--checkpoint_year', default=2018, type=int)
     parser.add_argument('--checkpoint_month', default=5, type=int)
-    parser.add_argument('--num_cpu_left', default=16, type=int)
+    parser.add_argument('--num_cpu_left', default=1, type=int)
     parser.add_argument('--queue_length', default=2, type=int)
 
     # Tunable Arguments
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--wd', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=8192, type=int)
+    parser.add_argument('--batch_size', default=1024, type=int)
     parser.add_argument('--first_n_moves', default=10, type=int)
     parser.add_argument('--last_n_moves', default=10, type=int)
     parser.add_argument('--dim_cnn', default=256, type=int)
+    parser.add_argument('--token_dim', default = 14, type=int)
     parser.add_argument('--dim_vit', default=1024, type=int)
     parser.add_argument('--num_blocks_cnn', default=5, type=int)
     parser.add_argument('--num_blocks_vit', default=5, type=int)
     parser.add_argument('--input_channels', default=18, type=int)
-    parser.add_argument('--vit_length', default=8, type=int)
+    parser.add_argument('--vit_length', default=66, type=int)
     parser.add_argument('--elo_dim', default=128, type=int)
     parser.add_argument('--side_info', default=True, type=bool)
     parser.add_argument('--side_info_coefficient', default=1, type=float)
@@ -594,3 +594,7 @@ def parse_args(args=None):
     parser.add_argument('--max_games_per_elo_range', default=20, type=int)
 
     return parser.parse_args(args)
+
+if __name__ == "__main__":
+    cfg = parse_args()
+    train.run(cfg)
