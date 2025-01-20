@@ -1,0 +1,133 @@
+from .utils import *
+from .train import *
+from .inference import *
+from .main import parse_args as main_parse_args, MAIA2Model as MainMAIA2Model
+from .transformer_only import *
+import pickle
+import chess.pgn
+import chess
+import pdb
+from multiprocessing import Pool, cpu_count, Queue, Process
+import torch
+import tqdm
+import argparse
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm.contrib.concurrent import process_map
+import os
+import pandas as pd
+import time
+from einops import rearrange
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def load_data(path, all_moves_dict):
+    reverse_moves_dict = {i: move for move, i in all_moves_dict.items()}
+    with open(path, 'rb') as file:
+        data = pickle.load(file)
+        print(data.keys())
+        reformatted = []
+        next_labels = [reverse_moves_dict[int(label)] for label in data['next_labels']]
+        for i in range(len(data['board_fen'])):
+            data_point = [data['board_fen'][i], next_labels[i], data['elos_self'][i], data['elos_oppo'][i]]
+            reformatted.append(data_point)
+        print(len(reformatted))
+        df = pd.DataFrame(reformatted, columns=["fen", "move", "elos_self", "elos_oppo"])
+        return df
+    
+def test_transformer_maia():
+
+    num_blocks = 5
+
+    cfg = parse_args()
+    cfg.num_blocks_vit = num_blocks
+    all_moves = get_all_possible_moves()
+    all_moves_dict = {move: i for i, move in enumerate(all_moves)}
+    elo_dict = create_elo_dict()
+
+    
+    data = load_data('../../../../../grace/u/geilender/maia2_activations_for_sae_2048_pooled.pkl', all_moves_dict=all_moves_dict)
+
+    epoch = 1
+
+    file_name = f'epoch_{epoch}_2019-05.pgn.pt'
+
+    state_dict = torch.load(f'../transformer_saves/0.0001_1024_1e-05/{file_name}', map_location=torch.device('cpu'))['model_state_dict']  # Use 'cuda' if you want to load it on a GPU
+    new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    
+    model = MAIA2Transformer(len(all_moves), elo_dict, cfg)
+    # print(state_dict.keys())
+    model.load_state_dict(new_state_dict)
+
+    print(f"Number of trainable parameters: {count_parameters(model)}")
+
+    _, acc = inference_batch(data, model, True, 512, 8, tokenize_board_to_tensor)
+
+    print(acc)
+
+    # accs = []
+    # for elo in elo_dict.values():
+
+    #     elo_specific_data = data[data["elos_self"].apply(lambda x: x.item() == elo)]
+
+    #     _, acc = inference_batch(elo_specific_data, model, True, 512, 8, tokenize_board_to_tensor)
+
+    #     accs.append(acc)
+    #     print(f"accuracy for Elo {elo} is {acc}")
+    
+    # print(accs)
+
+def test_cnn_maia():
+    
+    cfg = main_parse_args()
+    all_moves = get_all_possible_moves(flipped=True)
+    all_moves_dict = {move: i for i, move in enumerate(all_moves)}
+    elo_dict = create_elo_dict()
+
+    
+    data = load_data('../../../../../grace/u/geilender/maia2_activations_for_sae_2048_pooled.pkl', all_moves_dict=all_moves_dict)
+
+    epoch = 2
+
+    file_name = f'epoch_{epoch}_2019-05.pgn.pt'
+
+    state_dict = torch.load(f'../saves/0.0001_8192_1e-05/{file_name}', map_location=torch.device('cpu'))['model_state_dict']  # Use 'cuda' if you want to load it on a GPU
+    new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    
+    model = MainMAIA2Model(len(all_moves), elo_dict, cfg)
+    # print(state_dict.keys())
+    model.load_state_dict(new_state_dict)
+
+    print(f"Number of trainable parameters: {count_parameters(model)}")
+
+    # _, acc = inference_batch(data, model, True, 512, 8, board_to_tensor)
+
+    # print(acc)
+
+    accs = []
+
+    for elo in elo_dict.values():
+
+        print(type(elo))
+
+        elos_self_counts = data["elos_self"].apply(lambda x: x.item()).value_counts().to_dict()
+
+        # Print the counts
+        print(elos_self_counts)
+
+        elo_specific_data = data[data.apply(lambda row: row["elos_self"].item() == elo and row["elos_oppo"].item() == elo, axis=1)]
+
+        print(len(elo_specific_data))
+
+        _, acc = inference_batch(elo_specific_data, model, True, 512, 8, board_to_tensor)
+
+        accs.append(acc)
+        print(f"accuracy for Elo {elo} is {acc}")
+    print(accs)
+
+if __name__ == "__main__":
+
+    test_cnn_maia()
