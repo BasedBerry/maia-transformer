@@ -5,13 +5,14 @@ import os
 import random
 import numpy as np
 import torch
-import torch.nn as nn
-from io import StringIO
 import time
 import requests
 import tqdm
 import pyzstd
 import re
+from io import StringIO
+import random
+
 
 
 def seed_everything(seed: int):
@@ -284,29 +285,7 @@ def tokenize_board_to_tensor(board: chess.Board, token_dim=14):
     tensor = torch.tensor(tokens, dtype=torch.float32)
     return tensor
 
-class MoveTokenizer(nn.Module):
-    def __init__(self, input_dim=136, output_dim=14):
-        """
-        A module to tokenize chess moves into a fixed-dimensional embedding space.
 
-        Args:
-            input_dim (int): Dimensionality of the raw move representation (e.g., 136).
-            output_dim (int): Desired token dimension (e.g., 14, to match square tokens).
-        """
-        super(MoveTokenizer, self).__init__()
-        self.linear = nn.Linear(input_dim, output_dim)
-
-    def forward(self, moves):
-        """
-        Tokenize and project moves to a fixed embedding space.
-
-        Args:
-            moves (torch.Tensor): Tensor of raw move features (num_moves, input_dim).
-
-        Returns:
-            torch.Tensor: Tokenized moves of shape (num_moves, output_dim).
-        """
-        return self.linear(moves)
 
 def raw_move_representation(pgn_moves):
     """
@@ -354,84 +333,142 @@ def raw_move_representation(pgn_moves):
     # Convert to PyTorch tensor
     return torch.tensor(raw_features, dtype=torch.float32)
 
-# Example Usage
 
-def game_to_tensor(pgn, move_tokenizer, token_dim=14):
+
+
+def process_game_with_fen_insertion_and_mask_weighted(pgn, token_dim_fen=14, token_dim_combined=150):
     """
-    Parse a PGN, randomly pick a move, generate the FEN, insert FEN tokens into the move token sequence,
-    and construct a causal mask.
+    Parse a PGN, tokenize moves and FEN tokens, and align them into a unified embedding space (150 dimensions).
+    Includes a bias for generating pure FEN tokens or pure move tokens.
 
     Args:
         pgn (str): The PGN string of the game.
-        move_tokenizer (MoveTokenizer): The tokenizer for move embeddings.
-        token_dim (int): The dimension of the tokens (should match square token dimension).
+        token_dim_fen (int): Dimension of FEN tokens (default: 14).
+        token_dim_combined (int): Dimension of the combined embedding space (default: 150).
 
     Returns:
-        torch.Tensor: The combined sequence of move tokens and FEN tokens.
-        torch.Tensor: The corresponding causal mask.
+        torch.Tensor: Combined token sequence of shape (sequence_length, token_dim_combined).
+        torch.Tensor: Causal attention mask of shape (sequence_length, sequence_length).
     """
     # Parse the PGN
-    pgn_file = StringIO(pgn)  # Wrap the PGN string in a file-like object
+    pgn_file = StringIO(pgn)
     game = chess.pgn.read_game(pgn_file)
     board = game.board()
     moves = list(game.mainline_moves())
 
-    # Generate move tokens
-    raw_move_features = raw_move_representation(moves)  # Shape: (num_moves, 136)
-    move_tokens = move_tokenizer(raw_move_features)  # Shape: (num_moves, token_dim)
+    # Determine probabilities for random sampling
+    num_moves = len(moves)
+    total_indices = num_moves + 1  # Includes `-1` for pure FEN tokens
+    probabilities = np.full(total_indices, 1, dtype=np.float32)  # Uniform distribution
 
-    # Randomly pick a move index
-    random_move_index = random.randint(0, len(moves) - 1)
-    selected_move = moves[random_move_index]
+    # Adjust probabilities for special cases
+    fen_bias = 0.15  # Probability of pure FEN tokens
+    move_bias = 0.15  # Probability of pure move tokens
+    remaining_prob = 1 - (fen_bias + move_bias)
 
-    # Replay the game up to the selected move
-    board.reset()
-    for move in moves[:random_move_index + 1]:
-        board.push(move)
+    # Update probabilities
+    probabilities[-1] = fen_bias  # Pure FEN tokens (`-1`)
+    probabilities[-2] = move_bias  # Pure move tokens (last move index)
+    probabilities[:-2] *= remaining_prob / (total_indices - 2)  # Redistribute remaining probability
 
-    # Generate FEN tokens for the current board state
-    fen_tokens = tokenize_board_to_tensor(board, token_dim=token_dim)  # Shape: (66, token_dim)
+    # Ensure probabilities sum to 1
+    probabilities /= probabilities.sum()
+    # print(probabilities)
+    # Sample the move index with bias
+    move_index = np.random.choice(range(-1, num_moves), p=probabilities)
+    # print(move_index)
+    # Case 1: Pure FEN Tokens
+    try:
+        if move_index == num_moves - 1 or move_index == -1:
+            fen_tokens = tokenize_board_to_tensor(board, token_dim=token_dim_fen)  # Shape: (66, token_dim_fen)
+            sequence_length = fen_tokens.size(0)
+            combined_tokens = torch.zeros((sequence_length, token_dim_combined), dtype=torch.float32)
+            combined_tokens[:, 136:] = fen_tokens  # Place FEN tokens in the last 14 dimensions
+            causal_mask = torch.zeros((sequence_length, sequence_length), dtype=torch.bool)  # Fully unmasked
+            return combined_tokens, causal_mask
 
-    # Combine the sequence: moves up to the FEN, FEN tokens, and remaining moves
-    move_tokens_before_fen = move_tokens[:random_move_index + 1]  # Moves up to the FEN
-    move_tokens_after_fen = move_tokens[random_move_index + 1:]  # Moves after the FEN
-    combined_sequence = torch.cat([move_tokens_before_fen, fen_tokens, move_tokens_after_fen], dim=0)
+        # Case 2: Pure Move Tokens
+        elif move_index == num_moves - 2 or move_index == -2:
+            raw_move_features = raw_move_representation(moves)  # Shape: (num_moves, 136)
+            combined_tokens = torch.zeros((num_moves, token_dim_combined), dtype=torch.float32)
+            combined_tokens[:, :136] = raw_move_features  # Place move tokens in the first 136 dimensions
+            causal_mask = torch.zeros((num_moves, num_moves), dtype=torch.bool)
+            for i in range(num_moves):
+                causal_mask[i, i + 1:] = True  # Causal masking for moves
+            return combined_tokens, causal_mask
 
-    # Construct the causal mask
-    num_moves_before = random_move_index + 1
-    num_moves_after = len(moves) - random_move_index - 1
-    num_fen_tokens = fen_tokens.size(0)
-    total_tokens = num_moves_before + num_fen_tokens + num_moves_after
+        # Case 3: Mixed Move and FEN Tokens
+        else:
+            # Replay the game up to the selected move
+            for move in moves[:move_index + 1]:
+                board.push(move)
 
-    mask = torch.zeros((total_tokens, total_tokens), dtype=torch.bool)
+            # Generate FEN tokens
+            fen_tokens = tokenize_board_to_tensor(board, token_dim=token_dim_fen)  # Shape: (66, token_dim_fen)
 
-    # Moves-to-Moves Causal Mask
-    for i in range(num_moves_before):
-        mask[i, i + 1:] = True  # Prevent move i from attending to future moves
+            # Generate move tokens up to the selected index
+            raw_move_features = raw_move_representation(moves[:move_index + 1])  # Shape: (move_index + 1, 136)
 
-    # Moves-to-FEN Mask
-    for i in range(num_moves_before):
-        mask[i, num_moves_before: num_moves_before + num_fen_tokens] = False  # Moves can attend to FEN
+            # Combine moves and FEN tokens
+            num_fen_tokens = fen_tokens.size(0)
+            sequence_length = move_index + 1 + num_fen_tokens
+            combined_tokens = torch.zeros((sequence_length, token_dim_combined), dtype=torch.float32)
+            combined_tokens[:move_index + 1, :136] = raw_move_features  # Moves in first 136 dimensions
+            combined_tokens[move_index + 1:, 136:] = fen_tokens  # FEN in last 14 dimensions
 
-    # Moves-after-FEN Causal Mask
-    for i in range(num_moves_before + num_fen_tokens, total_tokens):
-        mask[i, i + 1:] = True  # Moves after FEN cannot attend to future moves
-        mask[i, :num_moves_before] = False  # Moves after FEN can attend to earlier moves
-        mask[i, num_moves_before: num_moves_before + num_fen_tokens] = False  # Moves after FEN can attend to FEN
+            # Construct causal mask
+            causal_mask = torch.zeros((sequence_length, sequence_length), dtype=torch.bool)
+            # Moves-to-Moves causal masking
+            for i in range(move_index + 1):
+                causal_mask[i, i + 1:] = True
+            # FEN tokens attend to everything
+            for i in range(move_index + 1, sequence_length):
+                causal_mask[i, :i] = False
 
-    # FEN-to-FEN: No restrictions
-    for i in range(num_moves_before, num_moves_before + num_fen_tokens):
-        mask[i, num_moves_before:num_moves_before + num_fen_tokens] = False  # FEN tokens can attend to each other
-        mask[i, :num_moves_before] = False  # FEN tokens can attend to all earlier move tokens
+            return combined_tokens, causal_mask
 
-    return combined_sequence, mask
+    except: 
+        print(pgn)
+        print(num_moves)
+        print(move_index)
+        print(probabilities)
+        
 
+def generate_flipped_pawn_promotions():
+    # Define the promotion rows for both colors and the promotion pieces
+    promotion_rows = {'white': '7'}
+    # promotion_rows = {'white': '7'}
+    promotion_pieces = ['q', 'r', 'b', 'n']
+    promotions = []
 
+    # Iterate over each color
+    for color, row in promotion_rows.items():
+        # Target rows for promotion (8 for white, 1 for black)
+        target_row = '8' if color == 'white' else '1'
+
+        # Each file from 'a' to 'h'
+        for file in 'abcdefgh':
+            # Direct move to promotion
+            for piece in promotion_pieces:
+                promotions.append(f'{file}{row}{file}{target_row}{piece}')
+
+            # Capturing moves to the left and right (if not on the edges of the board)
+            if file != 'a':
+                left_file = chr(ord(file) - 1)  # File to the left
+                for piece in promotion_pieces:
+                    promotions.append(f'{file}{row}{left_file}{target_row}{piece}')
+
+            if file != 'h':
+                right_file = chr(ord(file) + 1)  # File to the right
+                for piece in promotion_pieces:
+                    promotions.append(f'{file}{row}{right_file}{target_row}{piece}')
+
+    return promotions
 
 def generate_pawn_promotions():
     # Define the promotion rows for both colors and the promotion pieces
-    # promotion_rows = {'white': '7', 'black': '2'}
-    promotion_rows = {'white': '7'}
+    promotion_rows = {'white': '7', 'black': '2'}
+    # promotion_rows = {'white': '7'}
     promotion_pieces = ['q', 'r', 'b', 'n']
     promotions = []
 
@@ -519,7 +556,9 @@ def decompress_zst(file_path, decompressed_path):
         pyzstd.decompress_stream(compressed_file, decompressed_file)
 
 
-def get_all_possible_moves():
+
+
+def get_all_possible_moves(flipped=False):
     
     all_moves = []
 
@@ -539,13 +578,39 @@ def get_all_possible_moves():
     
     all_moves = [all_moves[i].uci() for i in range(len(all_moves))]
     
-    pawn_promotions = generate_pawn_promotions()
+    if not flipped:
+
+        pawn_promotions = generate_pawn_promotions()
+    
+    else:
+
+        pawn_promotions = generate_flipped_pawn_promotions()
     
     return all_moves + pawn_promotions
+
+def export_partial_pgn(game, move_count):
+    """
+    Export a PGN string up to a given number of moves.
+
+    Args:
+        game (chess.pgn.Game): The original game object.
+        move_count (int): The number of moves to include in the partial PGN.
+
+    Returns:
+        str: A PGN string with moves up to the specified count.
+    """
+    partial_game = chess.pgn.Game()
+    partial_game.headers = game.headers.copy()  # Copy headers (e.g., player names, event)
+    node = partial_game
+    for i, move in enumerate(game.mainline_moves()):
+        if i >= move_count:
+            break
+        node = node.add_variation(move)  # Add the move to the partial game
+    return str(partial_game)
+
 
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
-
