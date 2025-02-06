@@ -3,6 +3,7 @@ import chess
 import pdb
 from multiprocessing import Pool, cpu_count, Queue, Process
 import torch
+from torch.nn.utils.rnn import pad_sequence
 import tqdm
 import argparse
 from .utils import *
@@ -81,7 +82,7 @@ def process_per_game(game, white_elo, black_elo, white_win, cfg):
 
             if clock_info > cfg.clock_threshold:
                 # Generate the partial PGN string up to the current move
-                partial_pgn = export_partial_pgn(game, i + 1)
+                partial_pgn = export_partial_pgn(game, i)
                 move_uci = move.uci()  # Add move_uci explicitly
                 ret.append((partial_pgn, move_uci, elo_self, elo_oppo, active_win))
 
@@ -448,7 +449,7 @@ class MAIA2Transformer(torch.nn.Module):
         elos_emb = torch.cat((elos_emb_self, elos_emb_oppo), dim=1)
 
         # Pass through the transformer with attention mask
-        x = self.transformer(x, elos_emb, attn_mask)  # Include the mask in the transformer
+        x = self.transformer(x, elos_emb, attn_mask).mean(dim=1)  # Include the mask in the transformer
 
         # Final processing with layer normalization and fully connected layers
         x = self.last_ln(x)
@@ -543,13 +544,50 @@ def train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, cr
         Tuple of average losses for all tasks.
     """
     dataset_train = MAIA2Dataset(data, all_moves_dict, cfg)
+    
+    def collate_fn(batch):
+        """
+        Custom collate function for dynamically padding variable-length sequences 
+        while keeping computation efficient.
+        """
+        # Extract fields from batch
+        tokenized_sequences, causal_masks, elos_self, elos_oppo, move_labels, legal_moves, side_infos, active_wins = zip(*batch)
+
+        # Get the **longest sequence in the batch** (instead of fixed 512)
+        max_len = min(max(seq.shape[0] for seq in tokenized_sequences), 512)
+
+        # Pad sequences dynamically to max_len in batch
+        padded_sequences = pad_sequence(
+            [torch.cat((seq, torch.zeros(max_len - seq.shape[0], seq.shape[1]))) for seq in tokenized_sequences],
+            batch_first=True
+        )
+
+        # **Pad causal masks dynamically (since they are square)**
+        padded_causal_masks = torch.zeros((len(causal_masks), max_len, max_len), dtype=torch.bool)
+        for i, mask in enumerate(causal_masks):
+            seq_len = mask.shape[0]  # Original mask size
+            padded_causal_masks[i, :seq_len, :seq_len] = mask  # Copy original mask into top-left corner
+
+        return (
+            padded_sequences,  # [batch_size, max_len, 150]
+            padded_causal_masks,  # [batch_size, max_len, max_len] ✅ **Returning only the causal mask**
+            torch.tensor(elos_self, dtype=torch.long),
+            torch.tensor(elos_oppo, dtype=torch.long),
+            torch.tensor(move_labels, dtype=torch.long),
+            torch.stack(legal_moves),
+            torch.stack(side_infos),
+            torch.tensor(active_wins, dtype=torch.long)
+        )
+# Use the optimized `collate_fn` in DataLoader
     dataloader_train = torch.utils.data.DataLoader(
         dataset_train,
         batch_size=cfg.batch_size,
         shuffle=True,
-        drop_last=False,
-        num_workers=cfg.num_workers
+        num_workers=cfg.num_workers,
+        collate_fn=collate_fn,  # Use the optimized function
+        drop_last=False
     )
+
     if cfg.verbose:
         dataloader_train = tqdm.tqdm(dataloader_train)
 
@@ -582,6 +620,8 @@ def train_chunks(cfg, data, model, optimizer, all_moves_dict, criterion_maia, cr
 
         # Compute losses
         loss = 0
+        # print(logits_maia.shape)
+        # print(move_label.shape)
         loss_maia = criterion_maia(logits_maia, move_label)
         loss += loss_maia
 
@@ -652,7 +692,7 @@ def parse_args(args=None):
     # Tunable Arguments
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--wd', default=1e-5, type=float)
-    parser.add_argument('--batch_size', default=1024, type=int)
+    parser.add_argument('--batch_size', default=256, type=int)
     parser.add_argument('--first_n_moves', default=10, type=int)
     parser.add_argument('--last_n_moves', default=10, type=int)
     parser.add_argument('--dim_cnn', default=256, type=int)
