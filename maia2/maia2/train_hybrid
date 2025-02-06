@@ -27,6 +27,8 @@ def log_gpu_utilization(log_file):
             memory_total = gpu.memoryTotal  # In MB
             f.write(f"[{log_time}] GPU {gpu.id} - Utilization: {utilization:.2f}%, "
                     f"Memory Used: {memory_used:.2f}MB / {memory_total:.2f}MB\n")
+            print(f"[{log_time}] GPU {gpu.id} - Utilization: {utilization:.2f}%, "
+                    f"Memory Used: {memory_used:.2f}MB / {memory_total:.2f}MB\n")
 
 def ensure_gpu_log_file_exists(log_file):
     """
@@ -40,6 +42,8 @@ def ensure_gpu_log_file_exists(log_file):
 
 def run(cfg):
     save_root = '../'
+    gpus = GPUtil.getGPUs()
+    print(gpus)
     gpu_log_file = os.path.join(save_root, 'gpu_utilization.log')
     ensure_gpu_log_file_exists(gpu_log_file)
 
